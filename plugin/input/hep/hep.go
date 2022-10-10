@@ -2,6 +2,8 @@ package http
 
 import (
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"sync"
 
@@ -10,7 +12,6 @@ import (
 	"github.com/ozontech/file.d/longpanic"
 	"github.com/ozontech/file.d/metric"
 	"github.com/ozontech/file.d/pipeline"
-	"github.com/ozontech/file.d/tls"
 	"go.uber.org/zap"
 )
 
@@ -88,7 +89,8 @@ type Plugin struct {
 	readBuffs  *sync.Pool
 	eventBuffs *sync.Pool
 	controller pipeline.InputPluginController
-	server     *hep.Server
+	server     *net.UDPAddr
+	receiver   *net.UDPConn
 	sourceIDs  []pipeline.SourceID
 	sourceSeq  pipeline.SourceID
 	mu         *sync.Mutex
@@ -139,6 +141,7 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 	p.controller = params.Controller
 	p.controller.DisableStreams()
 	p.sourceIDs = make([]pipeline.SourceID, 0)
+	var err error
 
 	p.registerPluginMetrics()
 
@@ -149,7 +152,16 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 	case "no":
 		mux.HandleFunc("/", p.serve)
 	}
-	p.server = &hep.Server{Addr: p.config.Address, Handler: mux}
+
+	p.server, err = net.ResolveUDPAddr("udp", "10.0.0.1")
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	p.receiver, err = net.ListenUDP("udp", p.server)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	if p.config.Address != "off" {
 		longpanic.Go(p.listenHEP)
@@ -165,17 +177,8 @@ func (p *Plugin) registerPluginMetrics() {
 }
 
 func (p *Plugin) listenHEP() {
-	var err error
-	if p.config.CACert != "" || p.config.PrivateKey != "" {
-		tlsBuilder := tls.NewConfigBuilder()
-		err = tlsBuilder.AppendX509KeyPair(p.config.CACert, p.config.PrivateKey)
-		if err == nil {
-			p.server.TLSConfig = tlsBuilder.Build()
-			err = p.server.ListenAndServeTLS("", "")
-		}
-	} else {
-		err = p.server.ListenAndServe()
-	}
+
+	err := p.server.ListenAndServe()
 
 	if err != nil {
 		logger.Fatalf("input plugin http listening error address=%q: %s", p.config.Address, err.Error())
