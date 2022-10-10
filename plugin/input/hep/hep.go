@@ -178,7 +178,29 @@ func (p *Plugin) registerPluginMetrics() {
 
 func (p *Plugin) listenHEP() {
 
-	err := p.server.ListenAndServe()
+	for {
+		b := make([]byte, maxPktSize)
+		n, addr, err := conn.ReadFromUDP(b)
+		if err != nil {
+			log.Println("Error on XR read: ", err)
+			continue
+		}
+		if n >= maxPktSize {
+			log.Printf("Warning received packet from %s exceeds %d bytes\n", addr, maxPktSize)
+		}
+		if cfg.Debug {
+			log.Printf("Received following HEP report with %d bytes from %s:\n%s\n", n, addr, string(b[:n]))
+		} else {
+			log.Printf("Received packet with %d bytes from %s\n", n, addr)
+		}
+		var msg []byte
+		if msg, err = process(b[:n]); err != nil {
+			log.Println(err)
+			continue
+		}
+		inXRCh <- XRPacket{addr, msg}
+		outHEPCh <- b[:n]
+	}
 
 	if err != nil {
 		logger.Fatalf("input plugin http listening error address=%q: %s", p.config.Address, err.Error())
