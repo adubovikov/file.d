@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ozontech/file.d/fd"
 	"github.com/ozontech/file.d/logger"
@@ -77,10 +79,10 @@ curl "localhost:9200/_bulk" -H 'Content-Type: application/json' -d \
 }*/
 
 const (
-	subsystemName    = "input_hep"
-	httpErrorCounter = "hep_errors"
-
+	subsystemName     = "input_hep"
+	httpErrorCounter  = "hep_errors"
 	readBufDefaultLen = 16 * 1024
+	maxPktLen         = 65507
 )
 
 type Plugin struct {
@@ -95,6 +97,17 @@ type Plugin struct {
 	sourceSeq  pipeline.SourceID
 	mu         *sync.Mutex
 	logger     *zap.SugaredLogger
+	buffer     *sync.Pool
+	stopped    uint32
+	stats      HEPStats
+	inputCh    chan []byte
+}
+
+type HEPStats struct {
+	DupCount uint64
+	ErrCount uint64
+	HEPCount uint64
+	PktCount uint64
 }
 
 // ! config-params
@@ -178,32 +191,32 @@ func (p *Plugin) registerPluginMetrics() {
 
 func (p *Plugin) listenHEP() {
 
-	for {
-		b := make([]byte, maxPktSize)
-		n, addr, err := conn.ReadFromUDP(b)
-		if err != nil {
-			log.Println("Error on XR read: ", err)
-			continue
-		}
-		if n >= maxPktSize {
-			log.Printf("Warning received packet from %s exceeds %d bytes\n", addr, maxPktSize)
-		}
-		if cfg.Debug {
-			log.Printf("Received following HEP report with %d bytes from %s:\n%s\n", n, addr, string(b[:n]))
-		} else {
-			log.Printf("Received packet with %d bytes from %s\n", n, addr)
-		}
-		var msg []byte
-		if msg, err = process(b[:n]); err != nil {
-			log.Println(err)
-			continue
-		}
-		inXRCh <- XRPacket{addr, msg}
-		outHEPCh <- b[:n]
-	}
+	defer func() {
+		log.Printf("stopping UDP listener on %s", p.receiver.LocalAddr())
+		p.receiver.Close()
+	}()
 
-	if err != nil {
-		logger.Fatalf("input plugin http listening error address=%q: %s", p.config.Address, err.Error())
+	for {
+		if atomic.LoadUint32(&p.stopped) == 1 {
+			return
+		}
+		p.receiver.SetReadDeadline(time.Now().Add(1e9))
+		buf := p.buffer.Get().([]byte)
+		n, err := p.receiver.Read(buf)
+		if err != nil {
+			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+				continue
+			} else {
+				log.Printf("%v", err)
+				return
+			}
+		} else if n > maxPktLen {
+			log.Printf("received too big packet with %d bytes", n)
+			atomic.AddUint64(&p.stats.ErrCount, 1)
+			continue
+		}
+		p.inputCh <- buf[:n]
+		atomic.AddUint64(&p.stats.PktCount, 1)
 	}
 }
 
